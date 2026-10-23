@@ -104,7 +104,7 @@ def generate_bld_cad_linkage(period, state, extended_features=False):
     del cad_df
     bld_gdf = gpd.GeoDataFrame(bld_df, geometry="geometry", crs="EPSG:7844")
     del bld_df
-    if extended_features = True:
+    if extended_features == True:
         bld_gdf = bld_gdf.to_crs("EPSG:3577")
         bld_gdf_left = bld_gdf.copy()
         bld_gdf_left['_temp_id'] = range(len(bld_gdf_left))
@@ -153,14 +153,14 @@ def generate_bld_cad_linkage(period, state, extended_features=False):
     logging.info('Obtain geometries and compute area overlap...')
     bld_geoms = bld_gdf.loc[joined_valid.index, 'geometry']
     cad_geoms = cad_gdf.loc[joined_valid['index_right'], 'geometry']
-    joined_valid['BLD_PERIMETER'] = [b.length for b in bld geoms]
+    joined_valid['BLD_PERIMETER'] = [b.length for b in bld_geoms]
     joined_valid['BLD_INTERSECTION_AREA'] = [b.intersection(p).area for b, p in zip(bld_geoms, cad_geoms)]
     joined_valid['PCT_OF_BLD_INTERSECT'] = (joined_valid['BLD_INTERSECTION_AREA'] / joined_valid['BUILDING_AREA'])*100
     joined_valid['BLD_CROSS_PARCEL'] = np.where(joined_valid['PCT_OF_BLD_INTERSECT'] < 100, 1, 0)
     joined_valid['BLD_CAD_DISTANCE'] = [b.distance(p.boundary) for b, p in zip(bld_geoms, cad_geoms)]
     joined_valid['BLD_CAD_BOUNDARY_INTERSECTION'] = [b.intersection(p.boundary).length for b, p in zip(bld_geoms, cad_geoms)]
     joined_valid = joined_valid[joined_valid['PCT_OF_BLD_INTERSECT'] > 10]
-    joined_valid = joined_valid.drop(columns=['geometry', 'index_right', 'CAD_POLY', 'CADASTRE_PID'])'])
+    joined_valid = joined_valid.drop(columns=['geometry', 'index_right', 'CAD_POLY', 'CADASTRE_PID'])
     if extended_features == True:
         building_agg = joined_valid.groupby('CADASTRE_POLYGON_PID').agg({
             'BUILDING_AREA': ['count', 'sum', 'mean', 'std', 'min', 'max'],
@@ -494,7 +494,7 @@ def plot_confusion_matrix(cm, class_names=None, normalize=False, figsize=(10,8))
 
     return plt
 
-def calculate_all_metrics(y_test, predictions, class_names=None)
+def calculate_all_metrics(y_test, predictions, class_names=None):
     # Basic
     accuracy = accuracy_score(y_test, predictions)
     
@@ -654,7 +654,7 @@ def misclassification_analysis(y_test, predictions, class_names=None):
                 misclass.append({
                     'true': class_names[i],
                     'predicted': class_names[j],
-                    'count': cm[i, j]
+                    'count': cm[i, j],
                     'true_idx': i,
                     'pred_idx': j
                 })
