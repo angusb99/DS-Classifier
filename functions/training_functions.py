@@ -1,140 +1,298 @@
-import pandas as pd
-import numpy as np
-import time
-import geopandas as gpd
-from shapely import to_wkt
-import sys
-import math
-import libpysal
-import xgboost as xgb
-import matplotlib.pyplot as plt
-import seaborn as sns
-import boto3
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.metrics import (
-    confusion_matrix,
-    classification_report,
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    cohen_kappa_score,
-    matthews_corrcoef
-)
-from sklearn.preprocessing import LabelEncoder
+import json
 import logging
-import contextlib
-import os
+import time
+from pathlib import Path
+
+import geopandas as gpd
+import libpysal
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import shapely
+import xgboost as xgb
+# import boto3  # only used for the S3 uploads, which are commented out for local runs
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    cohen_kappa_score,
+    confusion_matrix,
+    matthews_corrcoef,
+    precision_recall_fscore_support,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+
 pd.set_option('display.max_columns', 500)
 pd.set_option('display.width', 1000)
 
+# Local stand-ins for the S3 locations
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LOCAL_INPUT_DIR = PROJECT_ROOT / "data" / "input"
+LOCAL_OUTPUT_DIR = PROJECT_ROOT / "data" / "output"
+
+SOURCE_CRS = "EPSG:7844"   # GDA2020 geographic, as stored in the source WKT / lat-long
+METRIC_CRS = "EPSG:9473"   # GDA2020 Australian Albers, for areas, lengths and distances
+
+PID = 'CADASTRE_POLYGON_PID'
+CATEGORICAL_FEATURES = ['MESHBLOCK', 'BLD_QUALITY_CLASS']
+NON_FEATURE_COLUMNS = ['STATE_ABBREVIATION', 'CADASTRE_POLYGON_PID', 'CADASTRE_PID', 'coord']
+OTHER_DWELLING_CODES = ['x35', 'x91', 'x92', 'x93', 'x94']
+
+
+# Ad hoc output folder (see set_output_location); None means the standard quarter-based layout
+_ADHOC_OUTPUT = None
+
+
+def set_output_location(adhoc_output=None):
+    """Redirect every output to an ad hoc folder instead of the quarter-based folders, e.g. for test runs in prod.
+
+    `adhoc_output` is a folder relative to the output root (e.g. "adhoc/2026-10-23_test") or an absolute path.
+    It replaces the {period}/{state} and {period}_DSIM/{state} folders, and also holds the plots, logs and
+    prediction files, so a test run never overwrites quarter outputs. The training table that train_test_model
+    and predict_candidates read back comes from the same folder. Inputs are unaffected. Call before start_log;
+    pass None to restore the standard layout.
+    """
+    global _ADHOC_OUTPUT
+    _ADHOC_OUTPUT = str(adhoc_output).strip("/") if adhoc_output else None
+    if _ADHOC_OUTPUT:
+        print(f"Writing outputs to ad hoc location: {_output_path('')}")
+
+
+def _output_path(file_name, quarter_folder=""):
+    """Where an output lives: under `quarter_folder` normally, or under the ad hoc folder when one is set."""
+    folder = _ADHOC_OUTPUT if _ADHOC_OUTPUT is not None else quarter_folder
+    # Prod equivalent - one change here routes every output, ad hoc included:
+    # return f"s3://PLACEHOLDER_OUTPUT_PATH/{folder + '/' if folder else ''}{file_name}"
+    path = LOCAL_OUTPUT_DIR / folder / file_name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _log_time(label, start_time):
+    message = f"{label}Execution Time: {(time.perf_counter() - start_time):.4f} seconds"
+    print(message)
+    logging.info(message)
+
+
 def start_log(state):
     logging.basicConfig(
-        filename=f'model_training_log_{state}.txt',
+        filename=_output_path(f"logs/model_training_log_{state}.txt"),
         level=logging.INFO,
         format="%(message)s",
-        filemode="w"
+        filemode="w",
+        force=True
     )
 
-# GENERATE ADR_CAD_LINKAGE_TRAINING - placeholders for all file paths
-def generate_ar_cad_linkage(period, state, pool = "candidate"):
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+def _wkt_to_gdf(df, wkt_column):
+    # pop() drops the WKT strings as soon as they are parsed - they are the largest column by far
+    geometry = gpd.GeoSeries.from_wkt(df.pop(wkt_column), crs=SOURCE_CRS)
+    return gpd.GeoDataFrame(df, geometry=geometry).to_crs(METRIC_CRS)
+
+
+def load_ar_df(period, state, pool):
+    file_name = {
+        "training": f"{period}_training_{state}.parquet",
+        "candidate": f"{period}_candidate_{state}.parquet",
+    }.get(pool, f"{period}_all_res_{state}.parquet")
+    # ar_df = pd.read_parquet(f"s3://DATLAKE_PATH_PLACEHOLDER/{period}_dsim/{file_name}")
+    ar_df = pd.read_parquet(LOCAL_INPUT_DIR / f"{period}_dsim" / file_name)
+    return ar_df.groupby('ARID', as_index=False).first()
+
+
+def load_cad_gdf(period, state):
+    # cad_df = pd.read_parquet(f"s3://DATLAKE_PATH_PLACEHOLDER/{period}_cad/{period}_cad_{state}.parquet").drop(columns="MB_CODE_2021")
+    cad_df = pd.read_parquet(LOCAL_INPUT_DIR / f"{period}_cad" / f"{period}_cad_{state}.parquet").drop(columns="MB_CODE_2021")
+    return _wkt_to_gdf(cad_df, 'CAD_POLY')
+
+
+def load_bld_gdf(period, state):
+    # bld_df = pd.read_parquet(f's3://PLACEHOLDER_FILE_PATH/{period}_bld/{period}_bld_{state}.parquet').drop(columns='MB_CODE_2021')
+    bld_df = pd.read_parquet(LOCAL_INPUT_DIR / f"{period}_bld" / f"{period}_bld_{state}.parquet").drop(columns='MB_CODE_2021')
+    return _wkt_to_gdf(bld_df, 'BLD_POLY')
+
+
+# ---------------------------------------------------------------------------
+# Feature building blocks
+# ---------------------------------------------------------------------------
+
+def _distinct_geocode_parcels(ar_cad, min_count):
+    """PIDs where every address has its own geocode and there are more than `min_count` of them."""
+    row_count = ar_cad[PID].value_counts()
+    distinct_count = (
+        ar_cad[[PID, 'LATITUDE', 'LONGITUDE']].dropna().drop_duplicates()[PID]
+        .value_counts()
+        .reindex(row_count.index, fill_value=0)
+    )
+    return row_count.index[(row_count == distinct_count) & (distinct_count > min_count)]
+
+
+def _add_neighbour_features(bld_gdf):
+    """Nearest other building distance, longest shared wall and touch flag for each building."""
+    geoms = bld_gdf[['geometry']]
+    nearest = gpd.sjoin_nearest(geoms, geoms, how='inner', distance_col='distance', exclusive=True)
+    neighbour_geoms = geoms.geometry.loc[nearest['index_right']].array
+    nearest['shared_length'] = shapely.length(
+        shapely.intersection(shapely.boundary(nearest.geometry.array), shapely.boundary(neighbour_geoms))
+    )
+    per_building = nearest.groupby(level=0)
+    nearest_distance = per_building['distance'].min()
+    return bld_gdf.assign(
+        BLD_MAX_SHARED_LENGTH=per_building['shared_length'].max(),
+        BLD_NEAREST_DISTANCE=nearest_distance,
+        BLD_TOUCH=(nearest_distance.reindex(bld_gdf.index) < 0.001).astype(int)
+    )
+
+
+def _dissolve_touching_buildings(bld_gdf, aggfunc):
+    """Merge buildings that share a vertex or edge (queen contiguity) into a single footprint."""
+    W = libpysal.weights.Queen.from_dataframe(bld_gdf, use_index=False, silence_warnings=True)
+    return bld_gdf.dissolve(by=W.component_labels, aggfunc=aggfunc)
+
+
+def _building_parcel_overlap(bld_gdf, cad_gdf):
+    """One row per (building, intersecting parcel) with overlap metrics. Both inputs in METRIC_CRS."""
+    joined = gpd.sjoin(bld_gdf, cad_gdf[[PID, 'geometry']], how='inner', predicate='intersects')
+    bld_geoms = joined.geometry.array
+    cad_geoms = cad_gdf.geometry.loc[joined.pop('index_right')].array
+    cad_boundaries = shapely.boundary(cad_geoms)
+    joined['BLD_PERIMETER'] = shapely.length(bld_geoms)
+    joined['BLD_INTERSECTION_AREA'] = shapely.area(shapely.intersection(bld_geoms, cad_geoms))
+    joined['PCT_OF_BLD_INTERSECT'] = (joined['BLD_INTERSECTION_AREA'] / joined['BUILDING_AREA']) * 100
+    joined['BLD_CROSS_PARCEL'] = (joined['PCT_OF_BLD_INTERSECT'] < 100).astype(int)
+    joined['BLD_CAD_DISTANCE'] = shapely.distance(bld_geoms, cad_boundaries)
+    joined['BLD_CAD_BOUNDARY_INTERSECTION'] = shapely.length(shapely.intersection(bld_geoms, cad_boundaries))
+    return pd.DataFrame(joined.drop(columns='geometry'))
+
+
+# Output column -> (input column, aggregation). Order matches the original flattened column lists.
+_BLD_AGG_BASE = {
+    'NUM_BUILDINGS': ('BUILDING_AREA', 'count'),
+    'TOTAL_BUILDING_AREA': ('BUILDING_AREA', 'sum'),
+    'MEAN_BUILDING_AREA': ('BUILDING_AREA', 'mean'),
+    'STD_BUILDING_AREA': ('BUILDING_AREA', 'std'),
+    'MIN_BUILDING_AREA': ('BUILDING_AREA', 'min'),
+    'MAX_BUILDING_AREA': ('BUILDING_AREA', 'max'),
+    'MEAN_BUILDING_PERIMETER': ('BLD_PERIMETER', 'mean'),
+    'TOTAL_BUILDING_PERIMETER': ('BLD_PERIMETER', 'sum'),
+    'MIN_BUILDING_INTERSECTION_AREA': ('BLD_INTERSECTION_AREA', 'min'),
+    'MEAN_BUILDING_INTERSECTION_AREA': ('BLD_INTERSECTION_AREA', 'mean'),
+    'MAX_BUILDING_INTERSECTION_AREA': ('BLD_INTERSECTION_AREA', 'max'),
+    'TOTAL_BUILDING_INTERSECTION_AREA': ('BLD_INTERSECTION_AREA', 'sum'),
+    'MIN_PCT_BUILDING_INTERSECTION': ('PCT_OF_BLD_INTERSECT', 'min'),
+    'MEAN_PCT_BUILDING_INTERSECTION': ('PCT_OF_BLD_INTERSECT', 'mean'),
+    'MAX_PCT_BUILDING_INTERSECTION': ('PCT_OF_BLD_INTERSECT', 'max'),
+    'TOTAL_BLD_ADDRESS_COUNT': ('ADDRESS_COUNT', 'sum'),
+    'BLD_QUALITY_CLASS': ('QUALITY_CLASS', 'first'),
+}
+_BLD_AGG_EXTENDED = {
+    'MIN_BLD_NEAREST_DISTANCE': ('BLD_NEAREST_DISTANCE', 'min'),
+    'MIN_BLD_MAX_SHARED_LENGTH': ('BLD_MAX_SHARED_LENGTH', 'min'),
+    'MEAN_BLD_MAX_SHARED_LENGTH': ('BLD_MAX_SHARED_LENGTH', 'mean'),
+    'MAX_BLD_MAX_SHARED_LENGTH': ('BLD_MAX_SHARED_LENGTH', 'max'),
+    'SUM_BLD_MAX_SHARED_LENGTH': ('BLD_MAX_SHARED_LENGTH', 'sum'),
+    'SUM_BLD_TOUCHING': ('BLD_TOUCH', 'sum'),
+}
+_BLD_AGG_CAD = {
+    'MIN_BLD_CAD_DISTANCE': ('BLD_CAD_DISTANCE', 'min'),
+    'MEAN_BLD_CAD_DISTANCE': ('BLD_CAD_DISTANCE', 'mean'),
+    'MAX_BLD_CAD_DISTANCE': ('BLD_CAD_DISTANCE', 'max'),
+    'SUM_BLD_CAD_DISTANCE': ('BLD_CAD_DISTANCE', 'sum'),
+    'MIN_BLD_CAD_BOUNDARY_INTERSECTION': ('BLD_CAD_BOUNDARY_INTERSECTION', 'min'),
+    'MEAN_BLD_CAD_BOUNDARY_INTERSECTION': ('BLD_CAD_BOUNDARY_INTERSECTION', 'mean'),
+    'MAX_BLD_CAD_BOUNDARY_INTERSECTION': ('BLD_CAD_BOUNDARY_INTERSECTION', 'max'),
+    'SUM_BLD_CAD_BOUNDARY_INTERSECTION': ('BLD_CAD_BOUNDARY_INTERSECTION', 'sum'),
+    'SUM_BLD_CROSS_PARCEL': ('BLD_CROSS_PARCEL', 'sum'),
+}
+
+
+def _aggregate_buildings_per_parcel(overlap, extended_features=False):
+    spec = {**_BLD_AGG_BASE, **(_BLD_AGG_EXTENDED if extended_features else {}), **_BLD_AGG_CAD}
+    building_agg = overlap.groupby(PID).agg(**spec).reset_index()
+    building_agg['BUILDING_SIZE_CV'] = (
+        building_agg['STD_BUILDING_AREA'] /
+        (building_agg['MEAN_BUILDING_AREA'] + 1e-6)
+    )
+    building_agg['BLD_SIZE_RANGE_RATIO'] = (
+        building_agg['MAX_BUILDING_AREA'] /
+        (building_agg['MIN_BUILDING_AREA'] + 1e-6)
+    )
+    return building_agg
+
+
+def _add_address_ratio_features(df, group_column):
+    """Address density features, with addresses counted per `group_column` (parcel or building)."""
+    df['ARIDS_PER_PARCEL'] = df.groupby(group_column)['ARID'].transform('nunique')
+    df['ARIDS_PER_BUILDING_RATIO'] = df['ARIDS_PER_PARCEL'] / df['NUM_BUILDINGS']
+    df['BUILDING_AREA_PER_ARID'] = df['TOTAL_BUILDING_AREA'] / df['ARIDS_PER_PARCEL']
+    df['CAD_AREA_PER_ARID'] = df['CAD_AREA'] / df['ARIDS_PER_PARCEL']
+    df['ARID_DENSITY'] = df['ARIDS_PER_PARCEL'] / df['CAD_AREA']
+    df['BUILDING_COVERAGE_RATIO'] = df['TOTAL_BUILDING_AREA'] / df['CAD_AREA']
+    df['LOG_CAD_AREA'] = np.log1p(df['CAD_AREA'])
+    df['LOG_BUILDING_TOTAL_AREA'] = np.log1p(df['TOTAL_BUILDING_AREA'])
+    df['LOG_ARID_PER_PARCEL'] = np.log1p(df['ARIDS_PER_PARCEL'])
+    df['BUILDING_TO_CAD_SIZE_RATIO'] = df['MEAN_BUILDING_AREA'] / df['CAD_AREA']
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Training data generation
+# ---------------------------------------------------------------------------
+
+# GENERATE ADR_CAD_LINKAGE_TRAINING
+def generate_ar_cad_linkage(period, state, pool="candidate", cad_gdf=None):
     start_time = time.perf_counter()
     print("Generating ADDR CAD Linkage")
-    logging.info("Generating ADDR CAD Linkage: Loading files from s3")
-    if pool == "training":
-        ar_df = pd.read_parquet(f"s3://DATLAKE_PATH_PLACEHOLDER/{period}_dsim/{period}_training_{state}.parquet").groupby('ARID', as_index=False).first()
-    elif pool == "candidate":
-        ar_df = pd.read_parquet(f"s3://DATLAKE_PATH_PLACEHOLDER/{period}_dsim/{period}_candidate_{state}.parquet").groupby('ARID', as_index=False).first()
-    else:
-        ar_df = pd.read_parquet(f"s3://DATLAKE_PATH_PLACEHOLDER/{period}_dsim/{period}_all_res_{state}.parquet").groupby('ARID', as_index=False).first()
-    cad_df = pd.read_parquet(f"s3://DATLAKE_PATH_PLACEHOLDER/{period}_cad/{period}_cad_{state}.parquet").drop(columns="MB_CODE_2021")
-    logging.info("Generating ADDR Cad Linkage: Creating Geometries")
-    cad_df['geometry'] = cad_df['CAD_POLY'].apply(wkt.loads)
-    logging.info("Generating ADDR CAD Linkage: Creating geodataframes")
-    cad_gdf = gpd.GeoDataFrame(cad_df, geometry="geometry", crs="EPSG:7844")
-    cad_gdf = cad_gdf.to_crs("EPSG:9473")
-    cad_gdf['CAD_PERIMETER'] = cad_gdf.geometry.length
-    cad_gdf['CAD_COMPACTNESS'] = (
-        4 * np.pi * cad_gdf['CAD_AREA'] /
-        (cad_gdf['CAD_PERIMETER'] ** 2 + 1e-6)
-    )
+    logging.info("Generating ADDR CAD Linkage: Loading files")
+    ar_df = load_ar_df(period, state, pool)
+    if cad_gdf is None:
+        cad_gdf = load_cad_gdf(period, state)
     cad_gdf = cad_gdf[cad_gdf['CAD_AREA'] > 100]
-    cad_gdf = cad_gdf.to_crs('EPSG:7844')
-    del cad_df
-    ar_gdf = gpd.GeoDataFrame(ar_df, geometry=gpd.points_from_xy(ar_df.LONGITUDE, ar_df.LATITUDE), crs="EPSG:7844")
+    cad_perimeter = cad_gdf.geometry.length
+    cad_gdf = cad_gdf.assign(
+        CAD_PERIMETER=cad_perimeter,
+        CAD_COMPACTNESS=4 * np.pi * cad_gdf['CAD_AREA'] / (cad_perimeter ** 2 + 1e-6)
+    )
+
+    ar_gdf = gpd.GeoDataFrame(
+        ar_df,
+        geometry=gpd.points_from_xy(ar_df.LONGITUDE, ar_df.LATITUDE, crs=SOURCE_CRS)
+    ).to_crs(METRIC_CRS)
     del ar_df
     logging.info("Generating ADDR CAD Linkage: Computing join")
     joined = gpd.sjoin(ar_gdf, cad_gdf, how='left', predicate='intersects')
-    missing_ar_gdf = ar_gdf[ar_gdf['ARID'].isin(joined[pd.isna(joined['CADASTRE_POLYGON_PID'])]['ARID'])]
-    missing_ar_gdf = missing_ar_gdf.to_crs('EPSG:9473')
-    cad_gdf = cad_gdf.to_crs('EPSG:9473')
-    joined_nearest = missing_ar_gdf.sjoin_nearest(cad_gdf, how='inner', distance_col='dist')
-    joined_nearest = joined_nearest.sort_values('dist').drop_duplicates(subset='ARID', keep='first')
-    joined_nearest = joined_nearest.drop(columns=['geometry', 'index_right', 'CAD_POLY', 'dist'])
-    del missing_ar_gdf, cad_gdf
-    joined = joined[pd.notna(joined['CADASTRE_POLYGON_PID'])]
-    joined = joined.drop(columns=['geometry', 'index_right', 'CAD_POLY'])
-    joined = pd.concat([joined, joined_nearest])
-    # Zipped coords for comparison
-    ar_cad = joined
-    ar_cad['coord'] = list(zip(ar_cad['LATITUDE', ar_cad['LONGITUDE']]))
-    ar_cad_counts = ar_cad.groupby('CADASTRE_POLYGON_PID').agg(
-        row_count=('coord', 'size'),
-        dist_coord_count=('coord', lambda s: pd.Series(s).dropna().nunique())
-    ).reset_index()
-    ar_mhe_for_review = ar_cad[ar_cad['CADASTRE_POLYGON_PID'].isin(
-        ar_cad_counts[(ar_cad_counts['row_count'] == ar_cad_counts['dist_coord_count']) &
-                      (ar_cad_counts['dist_coord_count'] > 6)]['CADASTRE_POLYGON_PID']
-    )][['ARID', 'CADASTRE_POLYGON_PID']]
-    end_time = time.perf_counter()
-    print(f"Execution Time: {(end_time - start_time):.4f} seconds")
-    logging.info(f"Execution Time: {(end_time - start_time):.4f} seconds")
-    return joined, ar_mhe_for_review
+    unmatched = joined[PID].isna()
+    # Addresses outside every parcel are attached to the closest one
+    joined_nearest = gpd.sjoin_nearest(ar_gdf.loc[joined.index[unmatched]], cad_gdf, how='inner', distance_col='dist')
+    joined_nearest = joined_nearest.sort_values('dist').drop_duplicates(subset='ARID', keep='first').drop(columns='dist')
+    del ar_gdf, cad_gdf
+    ar_cad = pd.DataFrame(
+        pd.concat([joined[~unmatched], joined_nearest]).drop(columns=['geometry', 'index_right'])
+    )
+    del joined, joined_nearest
 
-def generate_bld_cad_linkage(period, state, extended_features=False):
+    ar_mhe_for_review = ar_cad.loc[
+        ar_cad[PID].isin(_distinct_geocode_parcels(ar_cad, min_count=6)), ['ARID', PID]
+    ]
+    _log_time("", start_time)
+    return ar_cad, ar_mhe_for_review
+
+
+def generate_bld_cad_linkage(period, state, extended_features=False, bld_gdf=None, cad_gdf=None):
     start_time = time.perf_counter()
-    logging.info("Loading files from s3")
-    bld_df = pd.read_parquet(f's3://PLACEHOLDER_FILE_PATH/{period}_bld/{period}_bld_{state}.parquet').drop(columns='MB_CODE_2021')
-    cad_df = pd.read_parquet(f's3://PLACEHOLDER_FILE_PATH/{period}_cad/{period}_cad_{state}.parquet').drop(columns=['MB_CODE_2021', 'CAD_POLY_PID_COUNT'])
-    logging.info("Creating geometries...")
-    cad_df['geometry'] = cad_df['CAD_POLY'].apply(wkt.loads)
-    bld_df['geometry'] = bld_df['BLD_POLY'].apply(wkt.loads)
-    logging.info("Creating gdfs")
-    cad_gdf = gpd.GeoDataFrame(cad_df, geometry="geometry", crs="EPSG:7844")
-    del cad_df
-    bld_gdf = gpd.GeoDataFrame(bld_df, geometry="geometry", crs="EPSG:7844")
-    del bld_df
-    if extended_features == True:
-        bld_gdf = bld_gdf.to_crs("EPSG:3577")
-        bld_gdf_left = bld_gdf.copy()
-        bld_gdf_left['_temp_id'] = range(len(bld_gdf_left))
-        nearest = gpd.sjoin_nearest(
-            bld_gdf_left,
-            bld_gdf,
-            distance_col = 'distance',
-            how='left'
-        )
-        nearest = nearest[nearest['_temp_id'] != nearest.index_right]
-        def calc_shared_boundary_length(geom_left, geom_right):
-            if geom_left is None or geom_right is None:
-                return 0.0
-            inter = geom_left.boundar.intersection(geom_right.boundary)
-            return float(getattr(inter, "length", 0.0))
-        nearest['BLD_SHARED_LENGTH'] = [
-            calc_shared_boundary_length(gl, gr)
-            for gl, gr in zip(nearest["geometry"], bld_gdf.loc[nearest["index_right"], "geometry"])
-        ]
-        max_shared = nearest.groupby('_temp_id')['BLD_SHARED_LENGTH'].max().reset_index()
-        bld_gdf['BLD_MAX_SHARED_LENGTH'] = max_shared['BLD_SHARED_LENGTH']
-        min_distances = nearest.groupby('_temp_id')['distance'].min().reset_index()
-        del bld_gdf_left
-        bld_gdf['BLD_NEAREST_DISTANCE'] = min_distances['distance']
-        bld_gdf['BLD_TOUCH'] = np.where(bld_gdf['BLD_NEAREST_DISTANCE'] < 0.001, 1, 0)
-        del nearest
-        bld_gdf  = bld_gdf.to_crs('EPSG:7844')
-        W = libpysal.weights.Queen.from_dataframe(bld_gdf, use_index=False, silence_warnings=True)
-        components = W.component_labels
-        bld_gdf = bld_gdf.dissolve(by = components, aggfunc={
+    logging.info("Loading building and cadastre files")
+    if bld_gdf is None:
+        bld_gdf = load_bld_gdf(period, state)
+    if cad_gdf is None:
+        cad_gdf = load_cad_gdf(period, state)
+    if extended_features:
+        bld_gdf = _add_neighbour_features(bld_gdf)
+        bld_gdf = _dissolve_touching_buildings(bld_gdf, aggfunc={
             'BUILDING_AREA': 'sum',
             'QUALITY_CLASS': 'first',
             'BLD_MAX_SHARED_LENGTH': 'max',
@@ -143,327 +301,110 @@ def generate_bld_cad_linkage(period, state, extended_features=False):
             'BUILDING_NUM_VERTICES': 'sum',
             'ADDRESS_COUNT': 'max'
         })
-    logging.info('Computing join...')
-    joined = gpd.sjoin(bld_gdf, cad_gdf, how='left', predicate='intersects')
-    valid_mask = joined['index_right'].notna()
-    joined_valid = joined[valid_mask].copy()
-    logging.info("Reprojecting for real world area...")
-    cad_gdf = cad_gdf.to_crs('EPSG:3577')
-    bld_gdf = bld_gdf.to_crs('EPSG:3577')
-    logging.info('Obtain geometries and compute area overlap...')
-    bld_geoms = bld_gdf.loc[joined_valid.index, 'geometry']
-    cad_geoms = cad_gdf.loc[joined_valid['index_right'], 'geometry']
-    joined_valid['BLD_PERIMETER'] = [b.length for b in bld_geoms]
-    joined_valid['BLD_INTERSECTION_AREA'] = [b.intersection(p).area for b, p in zip(bld_geoms, cad_geoms)]
-    joined_valid['PCT_OF_BLD_INTERSECT'] = (joined_valid['BLD_INTERSECTION_AREA'] / joined_valid['BUILDING_AREA'])*100
-    joined_valid['BLD_CROSS_PARCEL'] = np.where(joined_valid['PCT_OF_BLD_INTERSECT'] < 100, 1, 0)
-    joined_valid['BLD_CAD_DISTANCE'] = [b.distance(p.boundary) for b, p in zip(bld_geoms, cad_geoms)]
-    joined_valid['BLD_CAD_BOUNDARY_INTERSECTION'] = [b.intersection(p.boundary).length for b, p in zip(bld_geoms, cad_geoms)]
-    joined_valid = joined_valid[joined_valid['PCT_OF_BLD_INTERSECT'] > 10]
-    joined_valid = joined_valid.drop(columns=['geometry', 'index_right', 'CAD_POLY', 'CADASTRE_PID'])
-    if extended_features == True:
-        building_agg = joined_valid.groupby('CADASTRE_POLYGON_PID').agg({
-            'BUILDING_AREA': ['count', 'sum', 'mean', 'std', 'min', 'max'],
-            'BLD_PERIMETER': ['mean', 'sum'],
-            'BLD_INTERSECTION_AREA': ['min', 'mean', 'max', 'sum'],
-            'PCT_OF_BLD_INTERSECT': ['min', 'mean', 'max'],
-            'ADDRESS_COUNT': 'sum',
-            'QUALITY_CLASS': 'first',
-            'BLD_NEAREST_DISTANCE': 'min',
-            'BLD_MAX_SHARED_LENGTH': ['min', 'mean', 'max', 'sum'],
-            'BLD_TOUCH': 'sum',
-            'BLD_CAD_DISTANCE': ['min', 'mean', 'max', 'sum'],
-            'BLD_CAD_BOUNDARY_INTERSECTION': ['min', 'mean', 'max', 'sum'],
-            'BLD_CROSS_PARCEL': 'sum'
-        }).reset_index()
-        # Flatten column names
-        building_agg.columns = [
-            'CADASTRE_POLYGON_PID',
-            'NUM_BUILDINGS',
-            'TOTAL_BUILDING_AREA',
-            'MEAN_BUILDING_AREA',
-            'STD_BUILDING_AREA',
-            'MIN_BUILDING_AREA',
-            'MAX_BUILDING_AREA',
-            'MEAN_BUILDING_PERIMETER',
-            'TOTAL_BUILDING_PERIMETER',
-            'MIN_BUILDING_INTERSECTION_AREA',
-            'MEAN_BUILDING_INTERSECTION_AREA',
-            'MAX_BUILDING_INTERSECTION_AREA',
-            'TOTAL_BUILDING_INTERSECTION_AREA',
-            'MIN_PCT_BUILDING_INTERSECTION',
-            'MEAN_PCT_BUILDING_INTERSECTION',
-            'MAX_PCT_BUILDING_INTERSECTION',
-            'TOTAL_BLD_ADDRESS_COUNT',
-            'BLD_QUALITY_CLASS',
-            'MIN_BLD_NEAREST_DISTANCE',
-            'MIN_BLD_MAX_SHARED_LENGTH',
-            'MEAN_BLD_MAX_SHARED_LENGTH',
-            'SUM_BLD_MAX_SHARED_LENGTH',
-            'SUM_BLD_TOUCHING',
-            'MIN_BLD_CAD_DISTANCE',
-            'MEAN_BLD_CAD_DISTANCE',
-            'MAX_BLD_CAD_DISTANCE',
-            'SUM_BLD_CAD_DISTANCE',
-            'MIN_BLD_CAD_BOUNDARY_INTERSECTION',
-            'MEAN_BLD_CAD_BOUNDARY_INTERSECTION',
-            'MAX_BLD_CAD_BOUNDARY_INTERSECTION',
-            'SUM_BLD_CAD_BOUNDARY_INTERSECTION',
-            'SUM_BLD_CROSS_PARCEL'
-        ]
-    else:
-        building_agg = joined_valid.groupby('CADASTRE_POLYGON_PID').agg({
-            'BUILDING_AREA': ['count', 'sum', 'mean', 'std', 'min', 'max'],
-            'BLD_PERIMETER': ['mean', 'sum'],
-            'BLD_INTERSECTION_AREA': ['min', 'mean', 'max', 'sum'],
-            'PCT_OF_BLD_INTERSECT': ['min', 'mean', 'max'],
-            'ADDRESS_COUNT': 'sum',
-            'QUALITY_CLASS': 'first',
-            'BLD_CAD_DISTANCE': ['min', 'mean', 'max', 'sum'],
-            'BLD_CAD_BOUNDARY_INTERSECTION': ['min', 'mean', 'max', 'sum'],
-            'BLD_CROSS_PARCEL': 'sum'
-        }).reset_index()
-        building_agg.columns = [
-            'CADASTRE_POLYGON_PID',
-            'NUM_BUILDINGS',
-            'TOTAL_BUILDING_AREA',
-            'MEAN_BUILDING_AREA',
-            'STD_BUILDING_AREA',
-            'MIN_BUILDING_AREA',
-            'MAX_BUILDING_AREA',
-            'MEAN_BUILDING_PERIMETER',
-            'TOTAL_BUILDING_PERIMETER',
-            'MIN_BUILDING_INTERSECTION_AREA',
-            'MEAN_BUILDING_INTERSECTION_AREA',
-            'MAX_BUILDING_INTERSECTION_AREA',
-            'TOTAL_BUILDING_INTERSECTION_AREA',
-            'MIN_PCT_BUILDING_INTERSECTION',
-            'MEAN_PCT_BUILDING_INTERSECTION',
-            'MAX_PCT_BUILDING_INTERSECTION',
-            'TOTAL_BLD_ADDRESS_COUNT',
-            'BLD_QUALITY_CLASS',
-            'MIN_BLD_CAD_DISTANCE',
-            'MEAN_BLD_CAD_DISTANCE',
-            'MAX_BLD_CAD_DISTANCE',
-            'SUM_BLD_CAD_DISTANCE',
-            'MIN_BLD_CAD_BOUNDARY_INTERSECTION',
-            'MEAN_BLD_CAD_BOUNDARY_INTERSECTION',
-            'MAX_BLD_CAD_BOUNDARY_INTERSECTION',
-            'SUM_BLD_CAD_BOUNDARY_INTERSECTION',
-            'SUM_BLD_CROSS_PARCEL'
-        ]
-    
-    building_agg['BUILDING_SIZE_CV'] = (
-        building_agg['STD_BUILDING_AREA'] /
-        (building_agg['MEAN_BUILDING_AREA'] + 1e-6)
-    )
-
-    building_agg['BLD_SIZE_RANGE_RATIO'] = (
-        building_agg['MAX_BUILDING_AREA'] /
-        (building_agg['MIN_BUILDING_AREA'] + 1e-6)
-    )
-    end_time = time.perf_counter()
-    print(f"Execution Time: {(end_time - start_time):.4f} seconds")
+    logging.info('Computing building/parcel overlap...')
+    overlap = _building_parcel_overlap(bld_gdf, cad_gdf)
+    overlap = overlap[overlap['PCT_OF_BLD_INTERSECT'] > 10]
+    building_agg = _aggregate_buildings_per_parcel(overlap, extended_features)
+    _log_time("", start_time)
     return building_agg
 
-def generate_ar_building_attachment(ar_cad, period, state, pool):
-    # Create set of zipped coords for comparison
-    ar_cad['coord'] = list(zip(ar_cad['LATITUDE'], ar_cad['LONGITUDE']))
-    ar_cad_counts = ar_cad.groupby('CADASTRE_POLYGON_PID').agg(
-        row_count=('coord', 'size'),
-        dist_coord_count=('coord', lambda s: pd.Series(s).dropna().nunique())
-    ).reset_index()
+
+def generate_ar_building_attachment(ar_cad, period, state, pool, bld_gdf=None, cad_gdf=None):
     # Where there is the same number of residential ADDR and distinct geocodes on a parcel, these are direct candidates for joining to specific buildings
-    direct_building_join_cand = ar_cad[ar_cad['CADASTRE_POLYGON_PID'].isin(
-        ar_cad_counts[(ar_cad_counts['row_count'] == ar_cad_counts['dist_coord_count']) &
-        (ar_cad_counts['dist_coord_count'] > 1)]['CADASTRE_POLYGON_PID']
-    )]
-    bld_df = pd.read_parquet(f's3://PLACEHOLDER_PATH/{period}_bld/{period}_bld_{state}.parquet').drop(columns='MB_CODE_2021')
-    bld_df['geometry'] = bld_df['BLD_POLY'].apply(wkt.loads)
-    bld_gdf = gpd.GeoDataFrame(bld_df, geometry="geometry", crs="EPSG:7844")
-    bld_gdf = bld_gdf.to_crs("EPSG:7844")
-    W = libpysal.weights.Queen.from_dataframe(bld_gdf, use_index=False, silence_warnings=True)
-    components = W.component_labels
-    bld_gdf = bld_gdf.dissolve(by=components, aggfunc={
+    direct_building_join_cand = ar_cad[ar_cad[PID].isin(_distinct_geocode_parcels(ar_cad, min_count=1))]
+    if bld_gdf is None:
+        bld_gdf = load_bld_gdf(period, state)
+    if cad_gdf is None:
+        cad_gdf = load_cad_gdf(period, state)
+    bld_gdf = _dissolve_touching_buildings(bld_gdf, aggfunc={
         'BUILDING_PID': 'first',
         'BUILDING_AREA': 'sum',
         'QUALITY_CLASS': 'first',
         'BUILDING_NUM_VERTICES': 'sum',
         'ADDRESS_COUNT': 'max'
     })
-    bld_gdf['NEW_ID'] = range(len(bld_gdf))
-    bld_gdf = bld_gdf.to_crs('EPSG:3577')
-    ar_gdf = gpd.GeoDataFrame(direct_building_join_cand, geometry=gpd.points_from_xy(direct_building_join_cand.LONGITUDE, direct_building_join_cand.LATITUDE), crs="EPSG:7844")
-    ar_gdf = ar_gdf.to_crs('EPSG:3577')
-    nearest = gpd.sjoin_nearest(
-        ar_gdf,
-        bld_gdf,
-        distance_col = 'distance',
-        how='left'
-    )
-    acceptable_distance = nearest[nearest['distance'] < 5]
-    regular_treatment_pool = ar_cad[~ar_cad['ARID'].isin(acceptable_distance['ARID'])]
-    cad_df = pd.read_parquet(f's3://PLACEHOLDER_PATH/{period}_cad/{period}_cad_{state}.parquet').drop(columns=['MB_CODE_2021', 'CAD_POLY_PID_COUNT'])
-    cad_df['geometry'] = cad_df['CAD_POLY'].apply(wkt.loads)
-    cad_gdf = gpd.GeoDataFrame(cad_df, geometry="geometry", crs="EPSG:7844")
-    bld_gdf = bld_gdf.to_crs("EPSG:7844")
-    joined = gpd.sjoin(bld_gdf, cad_gdf, how='left', predicate='intersects')
-    valid_mask = joined['index_right'].notna()
-    joined_valid = joined[valid_mask].copy()
-    logging.info("Reprojecting for real world area...")
-    cad_gdf = cad_gdf.to_crs('EPSG:3577')
-    bld_gdf = bld_gdf.to_crs('EPSG:3577')
-    logging.info("Obtain geometries and compute area ovrlap...")
-    bld_geoms = bld_gdf.loc[joined_valid.index, 'geometry']
-    cad_geoms = cad_gdf.loc[joined_valid['index_right'], 'geometry']
-    joined_valid['BLD_PERIMETER'] = [b.length for b in bld_geoms]
-    joined_valid['BLD_INTERSECTION_AREA'] = [b.intersection(p).area for b, p in zip(bld_geoms, cad_geoms)]
-    joined_valid['PCT_OF_BLD_INTERSECT'] = (joined_valid['BLD_INTERSECTION_AREA'] / joined_valid['BUILDING_AREA'])*100
-    joined_valid['BLD_CROSS_PARCEL'] = np.where(joined_valid['PCT_OF_BLD_INTERSECT'] < 100, 1, 0)
-    joined_valid['BLD_CAD_DISTANCE'] = [b.distance(p.boundary) for b, p in zip(bld_geoms, cad_geoms)]
-    joined_valid['BLD_CAD_BOUNDARY_INTERSECTION'] = [b.intersection(p.boundary).length for b, p in zip(bld_geoms, cad_geoms)]
-    joined_valid = joined_valid[(joined_valid['PCT_OF_BLD_INTERSECT'] > 20) | (joined_valid['PCT_OF_BLD_INTERSECT'] == 0)]
-    joined_valid = joined_valid.drop(columns=['geometry', 'index_right', 'CAD_POLY', 'CADASTRE_PID'])
-    joined_valid = joined_valid[joined_valid['CADASTRE_POLYGON_PID'].isin(acceptable_distance['CADASTRE_POLYGON_PID']) | (pd.isna(joined_valid['CADASTRE_POLYGON_PID']))]
-    building_agg = joined_valid.groupby('CADASTRE_POLYGON_PID').agg({
-            'BUILDING_AREA': ['count', 'sum', 'mean', 'std', 'min', 'max'],
-            'BLD_PERIMETER': ['mean', 'sum'],
-            'BLD_INTERSECTION_AREA': ['min', 'mean', 'max', 'sum'],
-            'PCT_OF_BLD_INTERSECT': ['min', 'mean', 'max'],
-            'ADDRESS_COUNT': 'sum',
-            'QUALITY_CLASS': 'first',
-            'BLD_CAD_DISTANCE': ['min', 'mean', 'max', 'sum'],
-            'BLD_CAD_BOUNDARY_INTERSECTION': ['min', 'mean', 'max', 'sum'],
-            'BLD_CROSS_PARCEL': 'sum'
-    }).reset_index()
-    building_agg.columns = [
-            'CADASTRE_POLYGON_PID',
-            'NUM_BUILDINGS',
-            'TOTAL_BUILDING_AREA',
-            'MEAN_BUILDING_AREA',
-            'STD_BUILDING_AREA',
-            'MIN_BUILDING_AREA',
-            'MAX_BUILDING_AREA',
-            'MEAN_BUILDING_PERIMETER',
-            'TOTAL_BUILDING_PERIMETER',
-            'MIN_BUILDING_INTERSECTION_AREA',
-            'MEAN_BUILDING_INTERSECTION_AREA',
-            'MAX_BUILDING_INTERSECTION_AREA',
-            'TOTAL_BUILDING_INTERSECTION_AREA',
-            'MIN_PCT_BUILDING_INTERSECTION',
-            'MEAN_PCT_BUILDING_INTERSECTION',
-            'MAX_PCT_BUILDING_INTERSECTION',
-            'TOTAL_BLD_ADDRESS_COUNT',
-            'BLD_QUALITY_CLASS',
-            'MIN_BLD_CAD_DISTANCE',
-            'MEAN_BLD_CAD_DISTANCE',
-            'MAX_BLD_CAD_DISTANCE',
-            'SUM_BLD_CAD_DISTANCE',
-            'MIN_BLD_CAD_BOUNDARY_INTERSECTION',
-            'MEAN_BLD_CAD_BOUNDARY_INTERSECTION',
-            'MAX_BLD_CAD_BOUNDARY_INTERSECTION',
-            'SUM_BLD_CAD_BOUNDARY_INTERSECTION',
-            'SUM_BLD_CROSS_PARCEL'
-        ]
-    building_agg['BUILDING_SIZE_CV'] = (
-        building_agg['STD_BUILDING_AREA'] /
-        (building_agg['MEAN_BUILDING_AREA'] + 1e-6)
-    )
+    bld_gdf['NEW_ID'] = np.arange(len(bld_gdf))
 
-    building_agg['BLD_SIZE_RANGE_RATIO'] = (
-        building_agg['MAX_BUILDING_AREA'] /
-        (building_agg['MIN_BUILDING_AREA'] + 1e-6)
+    ar_gdf = gpd.GeoDataFrame(
+        direct_building_join_cand,
+        geometry=gpd.points_from_xy(direct_building_join_cand.LONGITUDE, direct_building_join_cand.LATITUDE, crs=SOURCE_CRS)
+    ).to_crs(METRIC_CRS)
+    nearest = gpd.sjoin_nearest(ar_gdf, bld_gdf[['NEW_ID', 'geometry']], how='inner', distance_col='distance')
+    acceptable_distance = pd.DataFrame(
+        nearest.loc[nearest['distance'] < 5].drop(columns=['geometry', 'index_right', 'distance'])
     )
-    joined_df = acceptable_distance.merge(building_agg, how='left', on='NEW_ID')
-    joined_df = joined_df.drop_duplicates(subset='ARID')
-    joined_df['ARIDS_PER_PARCEL'] = joined_df.groupby('NEW_ID')['ARID'].transform('nunique')
-    joined_df['ARIDS_PER_BUILDING_RATIO'] = joined_df['ARIDS_PER_PARCEL'] / joined_df['NUM_BUILDINGS']
-    joined_df['BUILDING_AREA_PER_ARID'] = (
-        joined_df['TOTAL_BUILDING_AREA'] / joined_df['ARIDS_PER_PARCEL']
-    )
-    joined_df['CAD_AREA_PER_ARID'] = (
-        joined_df['CAD_AREA'] / joined_df['ARIDS_PER_PARCEL']
-    )
-    joined_df['ARID_DENSITY'] = (
-        joined_df['ARIDS_PER_PARCEL'] / joined_df['CAD_AREA']
-    )
-    joined_df['BUILDING_COVERAGE_RATIO'] = (
-        joined_df['TOTAL_BUILDING_AREA'] / joined_df['CAD_AREA']
-    )
-    joined_df['LOG_CAD_AREA'] = np.log1p(joined_df['CAD_AREA'])
-    joined_df['LOG_BUILDING_TOTAL_AREA'] = np.log1p(joined_df['TOTAL_BUILDING_AREA'])
-    joined_df['LOG_ARID_PER_PARCEL'] = np.log1p(joined_df['ARIDS_PER_PARCEL'])
-    joined_df['BUILDING_TO_CAD_SIZE_RATIO'] = (
-        joined_df['MEAN_BUILDING_AREA'] / joined_df['CAD_AREA']
-    )
-    joined_df = joined_df.drop(columns = ['coord', 'geometry', 'index_right', 'BUILDING_PID',
-    'BUILDING_AREA', 'QUALITY_CLASS', 'BUILDING_NUM_VERTICES', 'ADDRESS_COUNT', 'NEW_ID', 'distance'])
-    return joined_df
+    del ar_gdf, nearest
+
+    logging.info("Computing building/parcel overlap for directly attached addresses...")
+    overlap = _building_parcel_overlap(bld_gdf, cad_gdf)
+    overlap = overlap[(overlap['PCT_OF_BLD_INTERSECT'] > 20) | (overlap['PCT_OF_BLD_INTERSECT'] == 0)]
+    overlap = overlap[overlap[PID].isin(acceptable_distance[PID])]
+    building_agg = _aggregate_buildings_per_parcel(overlap)
+
+    joined_df = acceptable_distance.merge(building_agg, how='left', on=PID).drop_duplicates(subset='ARID')
+    joined_df = _add_address_ratio_features(joined_df, group_column='NEW_ID')
+    return joined_df.drop(columns='NEW_ID')
+
+
+def _training_output_path(period, state, pool):
+    file_name = {
+        "training": f"{period}_full_training_{state}.parquet",
+        "candidate": f"{period}_full_candidate_{state}.parquet",
+    }.get(pool, f"{period}_all_res_training_{state}.parquet")
+    # return f"s3://PLACEHOLDER_OUTPUT_PATH/{period}_DSIM/{state}/{file_name}"
+    return _output_path(file_name, f"{period}_DSIM/{state}")
+
 
 def generate_training_data_workflow(period, state, pool, method, extended_features):
     init_time = time.perf_counter()
-    ar_cad, ar_mhe_for_review = generate_ar_cad_linkage(period, state, pool)
-    ar_cad.to_parquet(f"s3://PLACEHOLDER_OUTPUT_PATH/{period}/{state}/{state}_ar_cad_linkage.parquet", index=False)
-    bld_cad = generate_bld_cad_linkage(period, state, extended_features)
-    joined_df = ar_cad.merge(bld_cad, how='left', on='CADASTRE_POLYGON_PID')
-    joined_df = joined_df.drop_duplicates(subset='ARID')
-    joined_df['ARIDS_PER_PARCEL'] = joined_df.groupby('CADASTRE_POLYGON_PID')['ARID'].transform('nunique')
-    joined_df['ARIDS_PER_BUILDING_RATIO'] = joined_df['ARIDS_PER_PARCEL'] / joined_df['NUM_BUILDINGS']
-    joined_df['BUILDING_AREA_PER_ARID'] = (
-        joined_df['TOTAL_BUILDING_AREA'] / joined_df['ARIDS_PER_PARCEL']
-    )
-    joined_df['CAD_AREA_PER_ARID'] = (
-        joined_df['CAD_AREA'] / joined_df['ARIDS_PER_PARCEL']
-    )
-    joined_df['ARID_DENSITY'] = (
-        joined_df['ARIDS_PER_PARCEL'] / joined_df['CAD_AREA']
-    )
-    joined_df['BUILDING_COVERAGE_RATIO'] = (
-        joined_df['TOTAL_BUILDING_AREA'] / joined_df['CAD_AREA']
-    )
-    joined_df['LOG_CAD_AREA'] = np.log1p(joined_df['CAD_AREA'])
-    joined_df['LOG_BUILDING_TOTAL_AREA'] = np.log1p(joined_df['TOTAL_BUILDING_AREA'])
-    joined_df['LOG_ARID_PER_PARCEL'] = np.log1p(joined_df['ARIDS_PER_PARCEL'])
-    joined_df['BUILDING_TO_CAD_SIZE_RATIO'] = (
-        joined_df['MEAN_BUILDING_AREA'] / joined_df['CAD_AREA']
-    )
+    # Parsed once and shared by every linkage step
+    cad_gdf = load_cad_gdf(period, state)
+    ar_cad, ar_mhe_for_review = generate_ar_cad_linkage(period, state, pool, cad_gdf=cad_gdf)
+    # ar_cad.to_parquet(f"s3://PLACEHOLDER_OUTPUT_PATH/{period}/{state}/{state}_ar_cad_linkage.parquet", index=False)
+    ar_cad.to_parquet(_output_path(f"{state}_ar_cad_linkage.parquet", f"{period}/{state}"), index=False)
+    # ar_mhe_for_review.to_csv(f"s3://PLACEHOLDER_OUTPUT_PATH/{period}/{state}/{period}_{state}_mhe_for_review.csv", index=False)
+    ar_mhe_for_review.to_csv(_output_path(f"{period}_{state}_mhe_for_review.csv", f"{period}/{state}"), index=False)
+    del ar_mhe_for_review
+
+    bld_gdf = load_bld_gdf(period, state)
+    bld_cad = generate_bld_cad_linkage(period, state, extended_features, bld_gdf=bld_gdf, cad_gdf=cad_gdf)
+    joined_df = ar_cad.merge(bld_cad, how='left', on=PID).drop_duplicates(subset='ARID')
+    del bld_cad
+    joined_df = _add_address_ratio_features(joined_df, group_column=PID)
+
     if method == "building_target":
-        ar_bld = generate_ar_building_attachment(ar_cad=ar_cad, period=period, state=state, pool=pool)
-        if extended_features == True:
-            joined_subset = joined_df[~joined_df['ARID'].isin(ar_bld['ARID'])].drop(columns=['MIN_BLD_NEAREST_DISTANCE', 'MIN_BLD_MAX_SHARED_LENGTH',
-            'MAX_BLD_MAX_SHARED_LENGTH', 'SUM_BLD_MAX_SHARED_LENGTH', 'SUM_BLD_TOUCHING'])
-        else:
-            joined_subset = joined_df[~joined_df['ARID'].isin(ar_bld['ARID'])]
-        bld_target_joined = pd.concat([joined_subset, ar_bld], axis=0)
-        if pool == "training":
-            bld_target_joined.to_parquet(f"s3://PLACEHOLDER_OUTPUT_PATH/{period}_DSIM/{state}/{period}_full_training_{state}.parquet", index=False)
-        elif pool == "candidate":
-            bld_target_joined.to_parquet(f"s3://PLACEHOLDER_OUTPUT_PATH/{period}_DSIM/{state}/{period}_full_candidate_{state}.parquet", index=False)
-        else:
-            bld_target_joined.to_parquet(f"s3://PLACEHOLDER_OUTPUT_PATH/{period}_DSIM/{state}/{period}_all_res_training{state}.parquet", index=False)
-    else:
-        if pool == "training":
-            joined_df.to_parquet(f"s3://PLACEHOLDER_OUTPUT_PATH/{period}_DSIM/{state}/{period}_full_training_{state}.parquet", index=False)
-        elif pool == "candidate":
-            joined_df.to_parquet(f"s3://PLACEHOLDER_OUTPUT_PATH/{period}_DSIM/{state}/{period}_full_candidate_{state}.parquet", index=False)
-        else:
-            joined_df.to_parquet(f"s3://PLACEHOLDER_OUTPUT_PATH/{period}_DSIM/{state}/{period}_all_res_training_{state}.parquet", index=False)
-    ar_mhe_for_review.to_csv(f"s3://PLACEHOLDER_OUTPUT_PATH/{period}/{state}/{period}_{state}_mhe_for_review.csv", index=False)
-    current_time = time.perf_counter()
-    logging.info(f"Completed {state}. Execution Time: {(current_time - init_time):.4f} seconds")
-    print(f"Completed {state}. Execution Time: {(current_time - init_time):.4f} seconds")
+        ar_bld = generate_ar_building_attachment(ar_cad, period, state, pool, bld_gdf=bld_gdf, cad_gdf=cad_gdf)
+        joined_df = joined_df[~joined_df['ARID'].isin(ar_bld['ARID'])]
+        if extended_features:
+            # Building-attached rows have no neighbour features, so drop them for the whole pool
+            joined_df = joined_df.drop(columns=list(_BLD_AGG_EXTENDED))
+        joined_df = pd.concat([joined_df, ar_bld], ignore_index=True)
+        del ar_bld
+    del ar_cad, bld_gdf, cad_gdf
+
+    joined_df.to_parquet(_training_output_path(period, state, pool), index=False)
+    _log_time(f"Completed {state}. ", init_time)
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+def _default_class_names(n):
+    return [f"Class {i}" for i in range(n)]
+
+
+def _predict_proba(model, X):
+    return model.inplace_predict(X)
 
 
 def get_confusion_matrix(model, X_test, y_test):
-    # Make predictions
-    dtest = xgb.DMatrix(X_test, enable_categorical=True)
-    predictions = model.predict(dtest)
-    # Calculate confusion matrix
+    predictions = _predict_proba(model, X_test).argmax(axis=1)
     cm = confusion_matrix(y_test, predictions)
-
     return cm, predictions
 
-def plot_confusion_matrix(cm, class_names=None, normalize=False, figsize=(10,8)):
+
+def plot_confusion_matrix(cm, class_names=None, normalize=False, figsize=(10, 8)):
     if normalize:
         cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
         fmt = '.2%'
@@ -471,12 +412,10 @@ def plot_confusion_matrix(cm, class_names=None, normalize=False, figsize=(10,8))
     else:
         fmt = 'd'
         title = 'Confusion Matrix (Counts)'
-    # Create labels
     if class_names is None:
-        class_names = [f'Class {i}' for i in range(len(cm))]
-    
-    # Create plot
-    plt.figure(figsize=figsize)
+        class_names = _default_class_names(len(cm))
+
+    fig, ax = plt.subplots(figsize=figsize)
     sns.heatmap(
         cm,
         annot=True,
@@ -484,58 +423,40 @@ def plot_confusion_matrix(cm, class_names=None, normalize=False, figsize=(10,8))
         cmap='Blues',
         xticklabels=class_names,
         yticklabels=class_names,
-        cbar_kws = {'label':'Count' if not normalize else 'Proportion'}
+        cbar_kws={'label': 'Count' if not normalize else 'Proportion'},
+        ax=ax
     )
+    # First class at the bottom, so the correct-prediction diagonal runs bottom-left to top-right
+    ax.invert_yaxis()
+    ax.set_title(title, fontsize=16, pad=20)
+    ax.set_ylabel('True Label', fontsize=12)
+    ax.set_xlabel('Predicted Label', fontsize=12)
+    fig.tight_layout()
+    return fig
 
-    plt.title(title, fontsize=16, pad=20)
-    plt.ylabel('True Label', fontsize=12)
-    plt.xlabel('Predicted Label', fontsize=12)
-    plt.tight_layout()
-
-    return plt
 
 def calculate_all_metrics(y_test, predictions, class_names=None):
-    # Basic
-    accuracy = accuracy_score(y_test, predictions)
-    
-    # Multi class
-    precision_macro = precision_score(y_test, predictions, average='macro', zero_division=0)
-    precision_weighted = precision_score(y_test, predictions, average='weighted', zero_division=0)
-    recall_macro = recall_score(y_test, predictions, average='macro', zero_division=0)
-    recall_weighted = recall_score(y_test, predictions, average='weighted', zero_division=0)
-    f1_macro = f1_score(y_test, predictions, average='macro', zero_division=0)
-    f1_weighted = f1_score(y_test, predictions, average='weighted', zero_division=0)
-
-    # Per class
-    precision_per_class = precision_score(y_test, predictions, average=None, zero_division=0)
-    recall_per_class = recall_score(y_test, predictions, average=None, zero_division=0)
-    f1_per_class = f1_score(y_test, predictions, average=None, zero_division=0)
-    # Additional metrics
-    kappa = cohen_kappa_score(y_test, predictions)
-    mcc = matthews_corrcoef(y_test, predictions)
-
-    metrics = {
-        'accuracy': accuracy,
-        'precision_macro': precision_macro,
-        'precision_weighted': precision_weighted,
-        'recall_macro': recall_macro,
-        'recall_weighted': recall_weighted,
-        'f1_macro': f1_macro,
-        'f1_weighted': f1_weighted,
-        'precision_per_class': precision_per_class,
-        'recall_per_class': recall_per_class,
-        'f1_per_class': f1_per_class,
-        'cohen_kappa': kappa,
-        'matthews_corrcoef': mcc
-    }
+    metrics = {'accuracy': accuracy_score(y_test, predictions)}
+    for average in ('macro', 'weighted'):
+        precision, recall, f1, _ = precision_recall_fscore_support(y_test, predictions, average=average, zero_division=0)
+        metrics[f'precision_{average}'] = precision
+        metrics[f'recall_{average}'] = recall
+        metrics[f'f1_{average}'] = f1
+    precision, recall, f1, _ = precision_recall_fscore_support(y_test, predictions, average=None, zero_division=0)
+    metrics['precision_per_class'] = precision
+    metrics['recall_per_class'] = recall
+    metrics['f1_per_class'] = f1
+    metrics['cohen_kappa'] = cohen_kappa_score(y_test, predictions)
+    metrics['matthews_corrcoef'] = matthews_corrcoef(y_test, predictions)
     return metrics
+
 
 def print_metrics_summary(metrics, class_names=None):
     logging.info("\n" + "=" * 70)
     logging.info("MODEL PERFORMANCE METRICS - TEST")
-    logging.info("="*70)
-    logging.info("OVERALL METICS")
-    logging.info("="*70)
+    logging.info("=" * 70)
+    logging.info("OVERALL METRICS")
+    logging.info("=" * 70)
     logging.info(f" Accuracy: {metrics['accuracy']:.4f} ({metrics['accuracy']*100:.2f}%)")
     logging.info(f" Precision (macro): {metrics['precision_macro']:.4f}")
     logging.info(f" Precision (weighted): {metrics['precision_weighted']:.4f}")
@@ -547,28 +468,19 @@ def print_metrics_summary(metrics, class_names=None):
     logging.info(f" Matthews Corr. Coef: {metrics['matthews_corrcoef']:.4f}")
 
     logging.info("\n PER-CLASS METRICS")
-    logging.info("-"*70)
+    logging.info("-" * 70)
     if class_names is None:
-        class_names = [f"Class {i}" for i in range(len(metrics['precision_per_class']))]
-    logging.info(f"{'Class':<20} {'Precision': <12} {'Recall': <12} {'F1-Score':<12}")
-    logging.info("-"*70)
-
-    for i, name in enumerate(class_names):
-        prec = metrics['precision_per_class'][i]
-        rec = metrics['recall_per_class'][i]
-        f1 = metrics['f1_per_class'][i]
+        class_names = _default_class_names(len(metrics['precision_per_class']))
+    logging.info(f"{'Class':<20} {'Precision':<12} {'Recall':<12} {'F1-Score':<12}")
+    logging.info("-" * 70)
+    for name, prec, rec, f1 in zip(class_names, metrics['precision_per_class'], metrics['recall_per_class'], metrics['f1_per_class']):
         logging.info(f"{name:<20} {prec:>11.4f} {rec:>11.4f} {f1:>11.4f}")
-    
-    logging.info("="*70)
+    logging.info("=" * 70)
 
 
 def get_classification_report(y_test, predictions, class_names=None):
-    if class_names is not None:
-        target_names = class_names
-    else:
-        target_names = [f"Class {i}" for i in range(len(np.unique(y_test)))]
-    
-    report = classification_report(
+    target_names = class_names if class_names is not None else _default_class_names(len(np.unique(y_test)))
+    return classification_report(
         y_test,
         predictions,
         target_names=target_names,
@@ -576,153 +488,123 @@ def get_classification_report(y_test, predictions, class_names=None):
         zero_division=0
     )
 
-    return report
 
-def analyze_per_class_performance(cm, class_names = None):
+def analyze_per_class_performance(cm, class_names=None):
     if class_names is None:
-        class_names = [f"Class {i}" for i in range(len(cm))]
-    
-    logging.info("\n" + "="*70)
+        class_names = _default_class_names(len(cm))
+
+    logging.info("\n" + "=" * 70)
     logging.info("PER-CLASS DETAILED ANALYSIS")
-    logging.info("="*70)
+    logging.info("=" * 70)
+    total = cm.sum()
     for i, name in enumerate(class_names):
         logging.info(f"\n{name}:")
-        logging.info("-"*70)
-        tp = cm[i,i]
-        fp = cm[:, i].sum() -tp
-        fn = cm[i, :].sum() - tp
-        tn = cm.sum() - tp - fp - fn
+        logging.info("-" * 70)
+        total_actual = cm[i, :].sum()
+        total_predicted = cm[:, i].sum()
+        tp = cm[i, i]
+        fp = total_predicted - tp
+        fn = total_actual - tp
+        tn = total - tp - fp - fn
 
-        # Calculate metrics
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0
         f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
 
-        total_actual = cm[i, :].sum()
-        total_predicted = cm[:, i].sum()
         logging.info(f" True Positives:     {tp:>6g}")
         logging.info(f" False Positives:    {fp:>6g}")
         logging.info(f" False Negatives:    {fn:>6g}")
         logging.info(f" True Negatives:     {tn:>6g}")
         logging.info(f" Total Actual:       {total_actual:>6g}")
-        logging.info(f" True Predicted:     {total_predicted:>6g}")
+        logging.info(f" Total Predicted:    {total_predicted:>6g}")
         logging.info(f" Precision:          {precision:>6.4f}")
         logging.info(f" Recall:             {recall:>6.4f}")
-        logging.info(f" F1-Score:           {f1:>6g}")
+        logging.info(f" F1-Score:           {f1:>6.4f}")
 
 
-def plot_per_class_metrics(metrics, class_names=None, figsize=(12,6)):
+def plot_per_class_metrics(metrics, class_names=None, figsize=(12, 6)):
     if class_names is None:
-        class_names = [f"Class {i}" for i in range(len(metrics['precision_per_class']))]
+        class_names = _default_class_names(len(metrics['precision_per_class']))
 
-    # Prep data
     x = np.arange(len(class_names))
     width = 0.25
     fig, ax = plt.subplots(figsize=figsize)
+    ax.bar(x - width, metrics['precision_per_class'], width, label='Precision', alpha=0.8)
+    ax.bar(x, metrics['recall_per_class'], width, label='Recall', alpha=0.8)
+    ax.bar(x + width, metrics['f1_per_class'], width, label='F1-Score', alpha=0.8)
 
-    # Bars
-    bars1 = ax.bar(x - width, metrics['preicsion_per_class'], width, label = 'Precision', alpha=0.8)
-    bars2 = ax.bar(x, metrics['recall_per_class'], width, label='Recall', alpha=0.8)
-    bars3 = ax.bar(x + width, metrics['f1_per_class'], width, label='F1-Score', alpha=0.8)
-
-    # Customise
     ax.set_xlabel('Class', fontsize=12)
     ax.set_ylabel('Score', fontsize=12)
-    ax.set_titel('Per-Class Performance Metrics', fontsize=14, pad=20)
+    ax.set_title('Per-Class Performance Metrics', fontsize=14, pad=20)
     ax.set_xticks(x)
     ax.set_xticklabels(class_names, rotation=45, ha='right')
     ax.legend()
     ax.grid(axis='y', alpha=0.3)
     ax.set_ylim([0, 1.0])
+    fig.tight_layout()
+    return fig
 
-    plt.tight_layout()
-    return plt
 
-def misclassification_analysis(y_test, predictions, class_names=None):
+def misclassification_analysis(y_test, predictions, class_names=None, cm=None):
+    if cm is None:
+        cm = confusion_matrix(y_test, predictions)
     if class_names is None:
-        class_names = [f"Class {i}" for i in range(len(np.unique(y_test)))]
-    cm = confusion_matrix(y_test, predictions)
-    logging.info("\n" + "="*70)
+        class_names = _default_class_names(len(cm))
+    logging.info("\n" + "=" * 70)
     logging.info("MISCLASSIFICATION ANALYSIS")
-    logging.info("="*70)
+    logging.info("=" * 70)
 
-    # Most common misclassifications
-    misclass = []
-    for i in range(len(cm)):
-        for j in range(len(cm)):
-            if i != j and cm[i, j] > 0:
-                misclass.append({
-                    'true': class_names[i],
-                    'predicted': class_names[j],
-                    'count': cm[i, j],
-                    'true_idx': i,
-                    'pred_idx': j
-                })
-
-    # Sort by count
-    misclass.sort(key=lambda x: x['count'], reverse=True)
+    true_idx, pred_idx = np.nonzero(cm * (1 - np.eye(len(cm), dtype=cm.dtype)))
+    misclass = sorted(
+        (
+            {'true': class_names[i], 'predicted': class_names[j], 'count': cm[i, j], 'true_idx': i, 'pred_idx': j}
+            for i, j in zip(true_idx, pred_idx)
+        ),
+        key=lambda item: item['count'],
+        reverse=True
+    )
     logging.info('\n Top 10 Misclassification Patterns:')
-    logging.info('-'*70)
-    logging.info(f"{'True Class':<20} -> {'Predicted': <20} {'Count':>10}")
-    logging.info('-'*70)
-
+    logging.info('-' * 70)
+    logging.info(f"{'True Class':<20} -> {'Predicted':<20} {'Count':>10}")
+    logging.info('-' * 70)
     for item in misclass[:10]:
-        print(f"{item['true']:<20} -> {item['predicted']:<20} {item['count']:>10}")
-
+        logging.info(f"{item['true']:<20} -> {item['predicted']:<20} {item['count']:>10}")
     return misclass
 
 
+def _save_figure(fig, file_name):
+    # Previously written to the working directory, uploaded to S3 and then deleted:
+    # s3_client = boto3.client('s3')
+    # s3_client.upload_file(Filename=file_name, Bucket="PLACEHOLDER", Key="PLACEHOLDER")
+    fig.savefig(_output_path(f"plots/{file_name}"), dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
 def complete_model_evaluation(period, state, method, model, X_test, y_test, class_names=None):
-    logging.info("\n" + "="*70)
+    logging.info("\n" + "=" * 70)
     logging.info("COMPLETE MODEL EVALUATION")
-    logging.info("="*70)
+    logging.info("=" * 70)
 
-    # Step 1: Get Predictions
     logging.info("\n[1] Making predictions on test set...")
-    dtest = xgb.DMatrix(X_test, enable_categorical=True)
-    predictions = model.predict(dtest)
+    predictions = _predict_proba(model, X_test)
     class_predictions = predictions.argmax(axis=1)
+    y_test = np.asarray(y_test).ravel()
 
-    # 2: Confusion Matrix
     cm = confusion_matrix(y_test, class_predictions)
-
-    # 3: Metrics
     metrics = calculate_all_metrics(y_test, class_predictions, class_names)
     print_metrics_summary(metrics, class_names)
 
-    # 4: Classification report
     report = get_classification_report(y_test, class_predictions, class_names)
     logging.info("\n" + report)
 
-    # 5: Per-Class Analysis
     analyze_per_class_performance(cm, class_names)
+    misclass = misclassification_analysis(y_test, class_predictions, class_names, cm=cm)
 
-    # 6: Misclassification Analysis
-    misclass = misclassification_analysis(y_test, class_predictions, class_names)
+    _save_figure(plot_confusion_matrix(cm, class_names, normalize=False), f'confusion_matrix_counts_{state}.png')
+    _save_figure(plot_confusion_matrix(cm, class_names, normalize=True), f'confusion_matrix_normalized_{state}.png')
+    _save_figure(plot_per_class_metrics(metrics, class_names), f'per_class_metrics_{state}.png')
 
-    # 7: Viz
-    plt1 = plot_confusion_matrix(cm, class_names, normalize=False)
-    plt1.savefig(f'confusion_matrix_counts_{state}.png', dpi=300, bbox_inches='tight')
-    plt.close()
-
-    plt2 = plot_confusion_matrix(cm, class_names, normalize=True)
-    plt2.savefig(f'confusion_matrix_normalized_{state}.png', dpi=300, bbox_inches='tight')
-    plt.close()
-
-    plt3 = plot_per_class_metrics(metrics, class_names)
-    plt3.savefig(f'per_class_metrics_{state}.png', dpi=300, bbox_inches='tight')
-    plt.close()
-
-    s3_client = boto3.client('s3')
-    s3_client.upload_file(Filename=f"confusion_matrix_counts_{state}.png", Bucket="PLACEHOLDER", Key="PLACEHOLDER")
-    s3_client.upload_file(Filename=f"confusion_matrix_normalized_{state}.png", Bucket="PLACEHOLDER", Key="PLACEHOLDER")
-    s3_client.upload_file(Filename=f"per_class_metrics_{state}.png", Bucket="PLACEHOLDER", Key="PLACEHOLDER")
-    with contextlib.supress(FileNotFoundError):
-        os.remove(f"confusion_matrix_counts_{state}.png")
-        os.remove(f"confusion_matrix_normalized_{state}.png")
-        os.remove(f"per_class_metrics_{state}.png")
-    
-    results = {
+    return {
         'predictions': predictions,
         'confusion_matrix': cm,
         'metrics': metrics,
@@ -730,261 +612,148 @@ def complete_model_evaluation(period, state, method, model, X_test, y_test, clas
         'misclassifications': misclass
     }
 
-    return results
+
+# ---------------------------------------------------------------------------
+# Training & prediction
+# ---------------------------------------------------------------------------
+
+_BASE_PARAMS = {
+    'tree_method': 'hist',
+    'device': 'cpu',
+    'max_bin': 128,
+    'objective': 'multi:softprob',
+    'eval_metric': 'mlogloss',
+    'nthread': -1,
+    'seed': 42,
+    'verbosity': 1
+}
+_STATE_PARAMS = {
+    'SA': {'subsample': 1, 'colsample_bytree': 0.6, 'max_depth': 11, 'min_child_weight': 3, 'learning_rate': 0.1,
+           'reg_lambda': 1, 'reg_alpha': 0.1, 'gamma': 0.4},
+    'NSW': {'subsample': 0.8, 'colsample_bytree': 0.8, 'max_depth': 10, 'min_child_weight': 4, 'learning_rate': 0.5,
+            'reg_lambda': 0.8, 'reg_alpha': 0.3, 'gamma': 0.4},
+    'QLD': {'subsample': 0.8, 'colsample_bytree': 0.6, 'colsample_bylevel': 0.6, 'max_depth': 12, 'min_child_weight': 1,
+            'learning_rate': 0.1, 'reg_lambda': 0.1, 'reg_alpha': 0, 'gamma': 0.4},
+    'NT': {'subsample': 1, 'colsample_bytree': 0.6, 'max_depth': 11, 'min_child_weight': 3, 'learning_rate': 0.03,
+           'reg_lambda': 1, 'reg_alpha': 0.1, 'gamma': 0.2},
+    'TAS': {'subsample': 0.8, 'colsample_bytree': 0.6, 'max_depth': 12, 'min_child_weight': 4, 'learning_rate': 0.1,
+            'reg_lambda': 1, 'reg_alpha': 0.55, 'gamma': 0.2},
+    'VIC': {'subsample': 1, 'colsample_bytree': 0.8, 'max_depth': 15, 'min_child_weight': 4, 'learning_rate': 0.05,
+            'reg_lambda': 10, 'reg_alpha': 0.1, 'gamma': 0.2},
+    'WA': {'subsample': 0.8, 'colsample_bytree': 0.6, 'max_depth': 12, 'min_child_weight': 4, 'learning_rate': 0.1,
+           'reg_lambda': 1, 'reg_alpha': 0.5, 'gamma': 0.2},
+    'ACT': {'subsample': 1, 'colsample_bytree': 0.6, 'max_depth': 11, 'min_child_weight': 1, 'learning_rate': 0.03,
+            'reg_lambda': 1, 'reg_alpha': 0.1, 'gamma': 0.4},
+}
+_STATE_NUM_ROUNDS = {'QLD': 2000, 'NSW': 3000, 'VIC': 2300, 'WA': 1800, 'SA': 1000, 'TAS': 1800, 'ACT': 1000, 'NT': 1000}
+
 
 def ultra_fast_training_config(state):
-    if state == "SA":
-        params = {
-            'tree_method': 'hist',
-            'device': 'cpu',
-            'max_bin': 128,
-            'subsample': 1,
-            'colsample_bytree': 0.6,
-            'max_depth': 11,
-            'min_child_weight': 3,
-            'learning_rate': 0.1,
-            'objective': 'multi:softprob',
-            'eval_metric': 'mlogloss',
-            'reg_lambda': 1,
-            'reg_alpha': 0.1,
-            'gamma': 0.4,
-            'n_jobs': -1,
-            'seed': 42,
-            'verbosity': 1
-        }
-    elif state == "NSW":
-        params = {
-            'tree_method': 'hist',
-            'device': 'cpu',
-            'max_bin': 128,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
-            'max_depth': 10,
-            'min_child_weight': 4,
-            'learning_rate': 0.5,
-            'objective': 'multi:softprob',
-            'eval_metric': 'mlogloss',
-            'reg_lambda': 0.8,
-            'reg_alpha': 0.3,
-            'gamma': 0.4,
-            'n_jobs': -1,
-            'seed': 42,
-            'verbosity': 1
-        }
-    elif state == "QLD":
-        params = {
-            'tree_method': 'hist',
-            'device': 'cpu',
-            'max_bin': 128,
-            'subsample': 0.8,
-            'colsample_bytree': 0.6,
-            'colsample_bylevel': 0.6,
-            'max_depth': 12,
-            'min_child_weight': 1,
-            'learning_rate': 0.1,
-            'objective': 'multi:softprob',
-            'eval_metric': 'mlogloss',
-            'reg_lambda': 0.1,
-            'reg_alpha': 0,
-            'gamma': 0.4,
-            'n_jobs': -1,
-            'seed': 42,
-            'verbosity': 1
-        }
-    elif state == "NT":
-        params = {
-            'tree_method': 'hist',
-            'device': 'cpu',
-            'max_bin': 128,
-            'subsample': 1,
-            'colsample_bytree': 0.6,
-            'max_depth': 11,
-            'min_child_weight': 3,
-            'learning_rate': 0.03,
-            'objective': 'multi:softprob',
-            'eval_metric': 'mlogloss',
-            'reg_lambda': 1,
-            'reg_alpha': 0.1,
-            'gamma': 0.2,
-            'n_jobs': -1,
-            'seed': 42,
-            'verbosity': 1
-        }
-    elif state == "TAS":
-        params = {
-            'tree_method': 'hist',
-            'device': 'cpu',
-            'max_bin': 128,
-            'subsample': 0.8,
-            'colsample_bytree': 0.6,
-            'max_depth': 12,
-            'min_child_weight': 4,
-            'learning_rate': 0.1,
-            'objective': 'multi:softprob',
-            'eval_metric': 'mlogloss',
-            'reg_lambda': 1,
-            'reg_alpha': 0.55,
-            'gamma': 0.2,
-            'n_jobs': -1,
-            'seed': 42,
-            'verbosity': 1
-        }
-    elif state == "VIC":
-        params = {
-            'tree_method': 'hist',
-            'device': 'cpu',
-            'max_bin': 128,
-            'subsample': 1,
-            'colsample_bytree': 0.8,
-            'max_depth': 15,
-            'min_child_weight': 4,
-            'learning_rate': 0.05,
-            'objective': 'multi:softprob',
-            'eval_metric': 'mlogloss',
-            'reg_lambda': 10,
-            'reg_alpha': 0.1,
-            'gamma': 0.2,
-            'n_jobs': -1,
-            'seed': 42,
-            'verbosity': 1
-        }
-    elif state == "WA":
-        params = {
-            'tree_method': 'hist',
-            'device': 'cpu',
-            'max_bin': 128,
-            'subsample': 0.8,
-            'colsample_bytree': 0.6,
-            'max_depth': 12,
-            'min_child_weight': 4,
-            'learning_rate': 0.1,
-            'objective': 'multi:softprob',
-            'eval_metric': 'mlogloss',
-            'reg_lambda': 1,
-            'reg_alpha': 0.5,
-            'gamma': 0.2,
-            'n_jobs': -1,
-            'seed': 42,
-            'verbosity': 1
-        }
-    elif state == "ACT":
-        params = {
-            'tree_method': 'hist',
-            'device': 'cpu',
-            'max_bin': 128,
-            'subsample': 1,
-            'colsample_bytree': 0.6,
-            'max_depth': 11,
-            'min_child_weight': 1,
-            'learning_rate': 0.03,
-            'objective': 'multi:softprob',
-            'eval_metric': 'mlogloss',
-            'reg_lambda': 1,
-            'reg_alpha': 0.1,
-            'gamma': 0.4,
-            'n_jobs': -1,
-            'seed': 42,
-            'verbosity': 1
-        }
-    return params
+    if state not in _STATE_PARAMS:
+        raise ValueError(f"No training config for state '{state}'")
+    return {**_BASE_PARAMS, **_STATE_PARAMS[state]}
 
 
-def train_test_model(period, state, method):
+def _load_model_frame(period, state):
+    # df = pd.read_parquet(f"s3://PLACEHOLDER_PATH/{period}_all_res_training_{state}.parquet")
+    df = pd.read_parquet(_training_output_path(period, state, pool="all"))
+    df = df.drop(columns=NON_FEATURE_COLUMNS, errors='ignore')
+    # XGBoost works in float32 internally, so this halves the frame without changing what the model sees
+    float_columns = df.select_dtypes('float64').columns
+    df[float_columns] = df[float_columns].astype('float32')
+    return df
+
+
+def _apply_training_categories(df, model):
+    """Encode categoricals with the training categories so codes line up with the fitted trees."""
+    categories = json.loads(model.attr('feature_categories'))
+    for column, values in categories.items():
+        df[column] = pd.Categorical(df[column], categories=values)
+    return df
+
+
+def train_test_model(period, state, method, collapse_other_classes=True):
     print("Starting Training and Testing of Model")
     start_time = time.perf_counter()
-    df_training = pd.read_parquet(f"s3://PLACEHOLDER_PATH/{period}_all_res_training_{state}.parquet").drop(columns=['STATE_ABBREVIATION', "CADASTRE_POLYGON_PID", 'CADASTRE_PID', 'coord'])
-    df_training = df_training[df_training['DS_SOURCE'].str.contains(r'DCAN', case=False, na=False) & pd.notna(df_training['DWELLING_STRUCT'])].drop(columns='DS_SOURCE')
-    df_training['DWELLING_STRUCT'] = np.where(
-        df_training['DWELLING_STRUCT'].isin(['x35', 'x91', 'x92', 'x93', 'x94']), 'OTHER',
-        df_training['DWELLING_STRUCT']
-    ) # Potentially remove this classification to speed it up a bit
-    labelled_result = df_training[['ARID', 'DWELLING_STRUCT']]
-    # Complete workflow
-    X_train, X_val, y_train, y_val = train_test_split(
-        df_training.drop(columns=['DWELLING_STRUCT']),
-        df_training[['DWELLING_STRUCT']],
-        test_size=0.1, random_state=42, stratify=df_training[['DWELLING_STRUCT']]
-    )
-    X_train['MESHBLOCK'] = X_train['MESHBLOCK'].astype("category")
-    X_train['BLD_QUALITY_CLASS'] = X_train['BLD_QUALITY_CLASS'].astype("category")
+    df_training = _load_model_frame(period, state)
+    df_training = df_training[
+        df_training['DS_SOURCE'].str.contains(r'DCAN', case=False, na=False) & df_training['DWELLING_STRUCT'].notna()
+    ].drop(columns='DS_SOURCE')
+    labels = df_training.pop('DWELLING_STRUCT')
+    if collapse_other_classes:
+        # Fewer classes trains faster; pass collapse_other_classes=False to model each code separately
+        labels = labels.mask(labels.isin(OTHER_DWELLING_CODES), 'OTHER')
+    # Categories are set before the split so train and validation share the same encoding
+    for column in CATEGORICAL_FEATURES:
+        df_training[column] = df_training[column].astype("category")
     le = LabelEncoder()
-    y_train['DWELLING_STRUCT'] = y_train['DWELLING_STRUCT'].astype("category")
-    y_train['DWELLING_STRUCT'] = le.fit_transform(y_train['DWELLING_STRUCT'])
-    dtrain = xgb.DMatrix(X_train.drop(columns='ARID'), label=y_train, enable_categorical=True)
-    X_val['MESHBLOCK'] = X_val['MESHBLOCK'].astype("category")
-    X_val['BLD_QUALITY_CLASS'] = X_val['BLD_QUALITY_CLASS'].astype("category")
-    class_set = y_val['DWELLING_STRUCT'].drop_duplicates().sort_values().tolist()
-    y_val['DWELLING_STRUCT'] = y_val['DWELLING_STRUCT'].astype("category")
-    y_val['DWELLING_STRUCT'] = le.fit_transform(y_val['DWELLING_STRUCT'])
-    dval = xgb.DMatrix(X_val.drop(columns='ARID'), label=y_val, enable_categorical=True)
+    y = le.fit_transform(labels)
+    del labels
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        df_training, y, test_size=0.1, random_state=42, stratify=y
+    )
+    del df_training
     params = ultra_fast_training_config(state)
-    params['num_class'] = len(np.unique(df_training['DWELLING_STRUCT']))
-    if state == "QLD":
-        num_rounds = 2000
-    elif state == "NSW":
-        num_rounds = 3000
-    elif state == "VIC":
-        num_rounds = 2300
-    elif state == "WA":
-        num_rounds = 1800
-    elif state == "SA":
-        num_rounds = 1000
-    elif state == "TAS":
-        num_rounds = 1800
-    elif state == "ACT":
-        num_rounds = 1000
-    elif state == "NT":
-        num_rounds = 1000
-    else:
-        num_rounds = 300
+    params['num_class'] = len(le.classes_)
+    # QuantileDMatrix builds the histogram bins directly, avoiding a full float copy of the training data
+    dtrain = xgb.QuantileDMatrix(X_train.drop(columns='ARID'), label=y_train, enable_categorical=True, max_bin=params['max_bin'])
+    del X_train
+    dval = xgb.QuantileDMatrix(X_val.drop(columns='ARID'), label=y_val, enable_categorical=True, max_bin=params['max_bin'], ref=dtrain)
     model = xgb.train(
         params,
         dtrain,
-        num_boost_round=num_rounds,
+        num_boost_round=_STATE_NUM_ROUNDS[state],
         evals=[(dtrain, "train"), (dval, "val")],
         early_stopping_rounds=50,
         verbose_eval=50
     )
-    end_time = time.perf_counter()
-    logging.info(f"Execution Time: {(end_time - start_time):.4f} seconds")
-    print(f"Execution Time: {(end_time - start_time):.4f} seconds")
+    model.set_attr(feature_categories=json.dumps(
+        {column: X_val[column].cat.categories.tolist() for column in CATEGORICAL_FEATURES}
+    ))
+    _log_time("", start_time)
     print("Completed Training and Testing of Model...")
-    return model, X_val, y_val, le, class_set
+    y_val = pd.DataFrame({'DWELLING_STRUCT': y_val}, index=X_val.index)
+    return model, X_val, y_val, le, le.classes_.tolist()
+
+
+def _probabilities_frame(probabilities, class_names, arids):
+    probs_df = pd.DataFrame(probabilities, columns=class_names)
+    probs_df['predicted_class'] = probs_df.idxmax(axis=1)
+    probs_df['max_prob'] = probabilities.max(axis=1)
+    probs_df['ARID'] = np.asarray(arids)
+    return probs_df
 
 
 def model_test_predictions(period, state, method, model_eval_output, X_val, y_val, class_names, le):
-    probs_df = pd.DataFrame(model_eval_output['predictions'], columns=class_names)
-    probs_df['predicted_class'] = probs_df.idxmax(axis=1)
-    probs_df['max_prob'] = probs_df[class_names].max(axis=1)
-    probs_df['ARID'] = X_val.iloc[:,0].values
-    probs_df['true_class'] = le.inverse_transform(y_val['DWELLING_STRUCTURE'])
-    probs_df.to_csv(f"s3://PLACEHOLDER_OUTPUT_PATH/{period}_{state}_training_prediction_validation_output.csv", index=False)
+    probs_df = _probabilities_frame(model_eval_output['predictions'], class_names, X_val['ARID'])
+    probs_df['true_class'] = le.inverse_transform(y_val['DWELLING_STRUCT'])
+    # probs_df.to_csv(f"s3://PLACEHOLDER_OUTPUT_PATH/{period}_{state}_training_prediction_validation_output.csv", index=False)
+    probs_df.to_csv(_output_path(f"{period}_{state}_training_prediction_validation_output.csv"), index=False)
     logging.info("Exported test predictions")
+
 
 def predict_candidates(period, state, method, model, class_set, pool="all"):
     print("Starting Predicting Candidates...")
-    df_cand = pd.read_parquet(f"s3://PLACEHOLDER_PATH/{period}_all_res_training_{state}.parquet").drop(columns = ['STATE_ABBREVIATION', 'CADASTRE_POLYGON_PID', 'CADASTRE_PID'])
+    df_cand = _load_model_frame(period, state)
     if pool == "all":
-        df_cand = df_cand[(df_cand['DS_SOURCE'].str.contains('IMPUTE', case=False, na=False)) | pd.isna(df_cand['DWELLING_STRUCT'])]
+        df_cand = df_cand[df_cand['DS_SOURCE'].str.contains('IMPUTE', case=False, na=False) | df_cand['DWELLING_STRUCT'].isna()]
     elif pool == "no_ds":
-        df_cand = df_cand[pd.isna(df_cand['DS_SOURCE']) | (df_cand['DS_SOURCE'] == "")]
+        df_cand = df_cand[df_cand['DS_SOURCE'].isna() | (df_cand['DS_SOURCE'] == "")]
     elif pool == "dsam":
         df_cand = df_cand[df_cand['DS_SOURCE'].str.contains('ADMIN', case=False, na=False)]
-    df_og_ds = df_cand[['DWELLING_STRUCT']]
-    df_cand = df_cand.drop(columns=['DS_SOURCE', 'DWELLING_STRUCT'])
-    df_cand['MESHBLOCK'] = df_cand['MESHBLOCK'].astype("category")
-    df_cand['BLD_QUALITY_CLASS'] = df_cand['BLD_QUALITY_CLASS'].astype("category")
-    dcand = xgb.DMatrix(df_cand.drop(columns='ARID'), enable_categorical=True)
-    prediction_probability = model.predict(dcand)
-    probs_df = pd.DataFrame(prediction_probability, columns=class_set),
-    probs_df['predicted_class'] = probs_df.idxmax(axis=1)
-    probs_df['max_prob'] = probs_df[class_set].max(axis=1)
-    probs_df['ARID'] = df_cand.iloc[:, 0].values
-    probs_df['original_class'] = df_og_ds.iloc[:,0].values
-    probs_df.to_csv(f"s3://PLACEHOLDER_PATH/{period}_{state}_{pool}_predictions.csv", index=False)
+    original_class = df_cand.pop('DWELLING_STRUCT')
+    arids = df_cand.pop('ARID')
+    df_cand = _apply_training_categories(df_cand.drop(columns='DS_SOURCE'), model)
+
+    probs_df = _probabilities_frame(_predict_proba(model, df_cand), class_set, arids)
+    probs_df['original_class'] = original_class.to_numpy()
+    # probs_df.to_csv(f"s3://PLACEHOLDER_PATH/{period}_{state}_{pool}_predictions.csv", index=False)
+    probs_df.to_csv(_output_path(f"{period}_{state}_{pool}_predictions.csv"), index=False)
     logging.info(f"Exported {period} {state} model for '{pool}' pool.")
-    s3_client = boto3.client('s3')
-    s3_client.upload_file(Filename=f"model_training_log_{state}.txt", Bucket="PLACEHOLDER", Key=f"PLACEHOLDER/model_training_log_{state}.txt")
-    with contextlib.suppress(FileNotFoundError):
-        os.remove(f"model_training_log_{state}.txt")
+    # The log file is now written straight to the output logs folder, so no upload/cleanup is needed:
+    # s3_client = boto3.client('s3')
+    # s3_client.upload_file(Filename=f"model_training_log_{state}.txt", Bucket="PLACEHOLDER", Key=f"PLACEHOLDER/model_training_log_{state}.txt")
+    # with contextlib.suppress(FileNotFoundError):
+    #     os.remove(f"model_training_log_{state}.txt")
     print(f"Completed predicting candidates for {state}.")

@@ -1,0 +1,4 @@
+.venv/
+__pycache__/
+# Synthetic inputs and pipeline outputs - regenerate with scripts/generate_synthetic_data.py
+data/
